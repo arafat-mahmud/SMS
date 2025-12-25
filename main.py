@@ -1,5 +1,6 @@
 import csv
 import random
+import re
 
 # বাংলাদেশের নির্দিষ্ট স্প্যাম প্যাটার্ন - বাস্তব সমস্যা
 spam_patterns = [
@@ -799,7 +800,34 @@ def generate_spam_message():
 
 
 def generate_ham_message():
-    return random.choice(ham_patterns)
+    base_msg = random.choice(ham_patterns)
+    
+    # যদি মেসেজে সংখ্যা থাকে (লেনদেন/অফার), তাহলে সংখ্যাগুলো পরিবর্তন করুন
+    if any(char.isdigit() for char in base_msg):
+        # মোবাইল নম্বর পরিবর্তন (01xxxxxxxxx)
+        base_msg = re.sub(r'01[3-9]\d{8}', lambda x: f"01{random.randint(3,9)}{random.randint(10000000,99999999)}", base_msg)
+        # টাকার পরিমাণ পরিবর্তন (3+ সংখ্যার ডিজিট)
+        base_msg = re.sub(r'\b\d{3,}\b', lambda x: str(random.randint(100, 99999)), base_msg)
+        # TrxID পরিবর্তন
+        if "TrxID" in base_msg:
+             base_msg = re.sub(r'TrxID [A-Z0-9]+', f'TrxID {random.choice(["A","B","C"])}{random.randint(100000000, 999999999)}', base_msg)
+    else:
+        # সাধারণ কথোপকথন - নাম বা সম্ভাষণ যোগ করুন
+        names = ["রাহিম", "করিম", "সুমনা", "রিনা", "বাবুল", "সাজু", "মিতা", "রাজু", "নিপা", "তিশা", "আরিফ", "সালাম", "জসিম", "রফিক", "শফিক", "তানিয়া", "লিজা", "মিমি", "পপি", "রুবেল", "সোহেল", "রানা", "মাসুম", "বিপুল", "শিমুল", "পলাশ", "বকুল", "শিউলি", "চম্পা", "বেলি"]
+        greetings = ["হাই", "হ্যালো", "শোন", "এই যে", "ওহে", "সালাম", "আদাব", "শুভ সকাল", "শুভ বিকাল", "শুভ সন্ধ্যা"]
+        closings = ["ভালো থেকো", "আল্লাহ হাফেজ", "বাই", "পরে কথা হবে", "রাখি", "টাটা", "ধন্যবাদ", "ওকে", "ঠিক আছে"]
+        
+        variation = random.random()
+        if variation < 0.2:
+            base_msg = f"{random.choice(names)}, {base_msg}"
+        elif variation < 0.4:
+            base_msg = f"{random.choice(greetings)}, {base_msg}"
+        elif variation < 0.6:
+            base_msg = f"{base_msg} - {random.choice(names)}"
+        elif variation < 0.8:
+            base_msg = f"{base_msg} {random.choice(closings)}।"
+            
+    return base_msg
 
 
 # অনন্য বার্তা তৈরি করুন
