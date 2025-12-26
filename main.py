@@ -1,6 +1,206 @@
+import argparse
 import csv
 import random
 import re
+import string
+
+
+SHORTENER_DOMAINS = {
+    "bit.ly",
+    "tinyurl.com",
+    "cutt.ly",
+    "rb.gy",
+    "t.ly",
+    "shorturl.at",
+    "is.gd",
+    "goo.gl",
+    "ow.ly",
+    "s.id",
+}
+
+
+def _count_digits(text: str) -> int:
+    # English digits 0-9 and Bangla digits ০-৯
+    return sum(ch.isdigit() or ("০" <= ch <= "৯") for ch in text)
+
+
+def _normalize_amount_and_percent(text: str) -> str:
+    # টাকা amounts (handle Bangla+English digits; avoid \b which is unreliable for Bengali text)
+    text = re.sub(
+        r"(?i)(?:\btk|\bbdt)\s*[0-9০-৯][0-9০-৯,\.]*",
+        "[AMOUNT]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)[0-9০-৯][0-9০-৯,\.]*\s*(?:টাকা|taka)",
+        "[AMOUNT] টাকা",
+        text,
+    )
+
+    # Percent
+    text = re.sub(r"[0-9০-৯][0-9০-৯,\.]*\s*%", "[PERCENT]%", text)
+    text = re.sub(
+        r"(?i)[0-9০-৯][0-9০-৯,\.]*\s*(?:শতাংশ|পারসেন্ট)",
+        "[PERCENT] শতাংশ",
+        text,
+    )
+    return text
+
+
+def _normalize_phone(text: str) -> str:
+    # Bangladeshi phone formats: 01XXXXXXXXX, +8801XXXXXXXXX, 8801XXXXXXXXX
+    text = re.sub(r"\b01[3-9]\d{8}\b", "[PHONE]", text)
+    text = re.sub(r"\b\+?8801[3-9]\d{8}\b", "[PHONE]", text)
+    return text
+
+
+def _normalize_urls(text: str) -> str:
+    # Match http(s)://... OR www.... OR domain/path
+    url_pattern = re.compile(
+        r"(?i)\b((?:https?://|www\.)\S+|(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/\S*)?)\b"
+    )
+
+    def repl(match: re.Match[str]) -> str:
+        url = match.group(1)
+        # Strip leading scheme and www for domain checks
+        domain = re.sub(r"(?i)^https?://", "", url)
+        domain = re.sub(r"(?i)^www\.", "", domain)
+        domain = domain.split("/")[0].lower()
+        if domain in SHORTENER_DOMAINS:
+            return "[SHORT_URL]"
+        return "[URL]"
+
+    return url_pattern.sub(repl, text)
+
+
+def normalize_text(text: str) -> str:
+    text = text.strip()
+    text = _normalize_urls(text)
+    text = _normalize_phone(text)
+    text = _normalize_amount_and_percent(text)
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+SPAM_SYNONYMS = {
+    "জরুরি": ["অতি জরুরি", "খুব জরুরি"],
+    "দ্রুত": ["তাড়াতাড়ি", "তাৎক্ষণিক"],
+    "এখনই": ["এই মুহূর্তে", "তৎক্ষণাৎ"],
+    "ক্লিক": ["চাপুন", "ট্যাপ"],
+    "ভেরিফাই": ["যাচাই", "নিশ্চিত"],
+    "কল": ["ফোন", "ডায়াল"],
+    "অফার": ["ডিল", "প্রস্তাব"],
+}
+
+
+def _synonym_replace(text: str, synonyms: dict[str, list[str]], p: float = 0.25) -> str:
+    for key, options in synonyms.items():
+        if key in text and random.random() < p:
+            text = text.replace(key, random.choice(options), 1)
+    return text
+
+
+def _random_insert(text: str, insertions: list[str], p: float = 0.15) -> str:
+    if random.random() >= p:
+        return text
+    words = text.split()
+    if not words:
+        return text
+    idx = random.randint(0, len(words))
+    words.insert(idx, random.choice(insertions))
+    return " ".join(words)
+
+
+def _random_delete(text: str, p: float = 0.12) -> str:
+    if random.random() >= p:
+        return text
+    words = text.split()
+    if len(words) <= 3:
+        return text
+    idx = random.randrange(len(words))
+    del words[idx]
+    return " ".join(words)
+
+
+def augment_spam_text(text: str) -> str:
+    text = _synonym_replace(text, SPAM_SYNONYMS)
+    text = _random_insert(text, ["দয়া করে", "সতর্কতা", "নোট:", "জরুরি নোটিস"], p=0.18)
+    text = _random_delete(text, p=0.12)
+    return text
+
+
+def augment_ham_text(text: str) -> str:
+    # Simple formal/informal toggles
+    if random.random() < 0.35:
+        text = text.replace("স্যার", "ভাই", 1)
+        text = text.replace("আপনি", "তুমি")
+        text = text.replace("প্লিজ", "")
+    if random.random() < 0.18:
+        text = _random_insert(text, ["আসলে", "মনে হয়", "একটু", "দয়া করে"], p=1.0)
+    text = _random_delete(text, p=0.08)
+    return text
+
+
+URGENT_WORDS = {"জরুরি", "দ্রুত", "এখনই", "তৎক্ষণাৎ", "তাৎক্ষণিক"}
+
+
+def categorize_message(label: str, normalized_text: str, raw_text: str) -> str:
+    if label != "spam":
+        return "ham"
+    t = normalized_text
+    r = raw_text
+
+    if any(k in r for k in ["ভোট", "জনসভা", "মহাসমাবেশ", "মিছিল", "মার্কায়", "নৌকা", "ধানের শীষ"]):
+        return "political"
+    if any(k in r for k in ["চ্যাট", "ভিডিও চ্যাট", "একাকী", "প্রোফাইল", "গোপন মেসেজ"]):
+        return "dating_scam"
+    if any(k in r for k in ["ভাইরাস", "হ্যাক", "অ্যান্টিভাইরাস", "ডাউনলোড", "আপডেট প্রয়োজন", "মেমোরি ফুল"]):
+        return "malware_link"
+    if any(k in r for k in ["পার্সেল", "ডেলিভারি", "কুরিয়ার", "কাস্টমস", "ট্র্যাক"]):
+        return "fake_delivery"
+    if "ক্রিপ্টো" in r or "crypto" in r.lower():
+        return "crypto"
+    if any(k in r for k in ["ব্রেকিং নিউজ", "ফেক নিউজ", "breaking"]):
+        return "fake_news"
+
+    if any(k in r for k in ["ঋণ", "লোন"]):
+        return "loan_spam"
+    if any(k in r for k in ["আয়", "ইনকাম", "জব", "চাকরি", "পার্ট টাইম"]):
+        return "job_scam"
+    if any(k in r for k in ["লটারি", "পুরস্কার", "বিজয়ী", "লাকি ড্র", "বোনাস"]):
+        return "lottery_spam"
+    if any(k in r for k in ["বিকাশ", "নগদ", "রকেট", "ব্যাংক", "otp", "OTP"]):
+        if "[URL]" in t or "[SHORT_URL]" in t:
+            return "phishing_url"
+        return "phishing_phone"
+
+    if "[URL]" in t or "[SHORT_URL]" in t:
+        return "advertisement"
+    return "spam_other"
+
+
+def _make_random_link() -> str:
+    # Generate a mix of shorteners and normal URLs
+    short_domains = sorted(SHORTENER_DOMAINS)
+    normal_domains = [
+        "mygp.li",
+        "bkash.com",
+        "nagad.com.bd",
+        "joinnavy.navy.mil.bd",
+        "bdtickets.com",
+        "cbl.fyi",
+        "example.com",
+    ]
+    domain = random.choice(short_domains + normal_domains)
+    path = "".join(random.choice(string.ascii_letters + string.digits) for _ in range(random.randint(5, 10)))
+
+    style = random.random()
+    if style < 0.4:
+        return f"https://{domain}/{path}"
+    if style < 0.7:
+        return f"http://{domain}/{path}"
+    return f"{domain}/{path}"
 
 # বাংলাদেশের নির্দিষ্ট স্প্যাম প্যাটার্ন - বাস্তব সমস্যা
 spam_patterns = [
@@ -116,6 +316,22 @@ spam_patterns = [
     "কুরিয়ার যোগাযোগ করতে পারেনি। যোগাযোগ: {phone}",
     "পার্সেল ছাড়পত্র প্রয়োজন। পেমেন্ট: {link}",
     "ডেলিভারি চার্জ বকেয়া। পরিশোধ করুন: {link}",
+    # রাজনৈতিক/প্রচারণা (কভারেজ)
+    "আগামীকাল {location} এ বিশাল জনসভা। প্রধান অতিথি {name}। দলে দলে যোগ দিন।",
+    "{party} এর পক্ষ থেকে সবাইকে ঈদের শুভেচ্ছা। - {name}",
+    "দেশ ও দশের উন্নয়নে {symbol} মার্কায় ভোট দিন।",
+    "আগামী {date} তারিখ সকাল ১০টায় {location} এ বিক্ষোভ মিছিল।",
+    "চল চল {location} চল। {party} এর মহাসমাবেশ সফল করি।",
+    # ডেটিং/স্ক্যাম (কভারেজ)
+    "হাই, আমি {girl_name}। তোমার প্রোফাইল দেখলাম। কথা বলতে চাইলে কল করো: {phone}",
+    "তোমার জন্য একটা গোপন মেসেজ আছে। শুনতে কল করো {phone} নম্বরে।",
+    "একাকী লাগছে? আমার সাথে চ্যাট করতে ক্লিক করো: {link}",
+    "{girl_name} তোমাকে মিস করছে। তার ভয়েস মেসেজ শুনতে ডায়াল করো {phone}",
+    # ম্যালওয়্যার/ভাইরাস (কভারেজ)
+    "আপনার ফোনে ভাইরাস ধরা পড়েছে! এখনই ক্লিন করতে ক্লিক করুন: {link}",
+    "আপনার হোয়াটসঅ্যাপ আপডেট প্রয়োজন। পুরনো ভার্সন বন্ধ হয়ে যাবে। আপডেট: {link}",
+    "ফ্রি অ্যান্টিভাইরাস ডাউনলোড করুন এবং ফোন ফাস্ট করুন: {link}",
+    "সতর্কতা! আপনার ফোন হ্যাক হতে পারে। সুরক্ষা চালু করুন: {link}",
     # লাকি ড্র/পুরস্কার স্ক্যাম
     "আপনি লাকি ড্রতে নির্বাচিত হয়েছেন। {amount} টাকা জিতেছেন! দাবি: {link}",
     "আপনার জন্য পুরস্কার অপেক্ষা করছে। গ্রহণ করুন: {link}",
@@ -770,6 +986,23 @@ def generate_spam_message():
     years = ["2025", "2026", "2027", "2024"]
     counts = [1, 2, 3, 5, 10, 15, 20, 25, 30]
 
+    names = [
+        "রাহিম",
+        "করিম",
+        "সুমনা",
+        "আরিফ",
+        "রফিক",
+        "শফিক",
+        "তানিয়া",
+        "সোহেল",
+        "মাসুম",
+        "মির্জা ফখরুল",
+        "ওবায়দুল কাদের",
+    ]
+    parties = ["আওয়ামী লীগ", "বিএনপি", "জাতীয় পার্টি", "জামায়াত", "সিপিবি", "বাসদ"]
+    symbols = ["নৌকা", "ধানের শীষ", "লাঙ্গল", "দাঁড়িপাল্লা", "কাস্তে", "মশাল"]
+    girl_names = ["প্রিয়া", "নিশি", "তিশা", "মিমি", "লিজা", "রিয়া", "সাদিয়া", "ফারজানা"]
+
     message = template.format(
         phone=f"0{random.randint(1500000000, 1999999999)}",
         amount=random.choice(
@@ -783,7 +1016,7 @@ def generate_spam_message():
         hour=random.choice([1, 2, 3, 6, 12, 24, 48]),
         company=random.choice(companies),
         bank=random.choice(banks),
-        link=f"bit.ly/{random.randint(10000, 99999)}",
+        link=_make_random_link(),
         medicine=random.choice(medicines),
         location=random.choice(locations),
         size=random.choice([650, 850, 1000, 1200, 1400, 1600]),
@@ -795,6 +1028,10 @@ def generate_spam_message():
         date=random.choice(dates),
         year=random.choice(years),
         count=random.choice(counts),
+        name=random.choice(names),
+        party=random.choice(parties),
+        symbol=random.choice(symbols),
+        girl_name=random.choice(girl_names),
     )
     return message
 
@@ -830,39 +1067,178 @@ def generate_ham_message():
     return base_msg
 
 
-# অনন্য বার্তা তৈরি করুন
-spam_messages = set()
-ham_messages = set()
+def _is_too_short(normalized_text: str) -> bool:
+    return len([w for w in normalized_text.split() if w.strip()]) < 3
 
-# ২২৭৫টি অনন্য স্প্যাম বার্তা তৈরি করুন (৩৫%)
-print("স্প্যাম বার্তা তৈরি করা হচ্ছে...")
-while len(spam_messages) < 2275:
-    msg = generate_spam_message()
-    spam_messages.add(msg)
-    if len(spam_messages) % 200 == 0:
-        print(f"স্প্যাম: {len(spam_messages)}/2275")
 
-# ৪২২৫টি অনন্য হ্যাম বার্তা তৈরি করুন (৬৫%)
-print("হ্যাম বার্তা তৈরি করা হচ্ছে...")
-while len(ham_messages) < 4225:
-    msg = generate_ham_message()
-    ham_messages.add(msg)
-    if len(ham_messages) % 200 == 0:
-        print(f"হ্যাম: {len(ham_messages)}/4225")
+def _make_split_labels(labels: list[str], train: float, val: float, test: float) -> list[str]:
+    # Stratified-ish split without external deps: shuffle indices per class.
+    if abs((train + val + test) - 1.0) > 1e-9:
+        raise ValueError("train+val+test must sum to 1.0")
 
-# একত্রিত এবং এলোমেলো করুন
-data = [{"label": "spam", "text": msg} for msg in spam_messages]
-data.extend([{"label": "ham", "text": msg} for msg in ham_messages])
-random.shuffle(data)
+    class_to_indices: dict[str, list[int]] = {}
+    for i, y in enumerate(labels):
+        class_to_indices.setdefault(y, []).append(i)
 
-# সিএসভিতে সংরক্ষণ করুন
-with open("bangla_sms_dataset.csv", "w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(f, fieldnames=["label", "text"])
-    writer.writeheader()
-    writer.writerows(data)
+    splits = [""] * len(labels)
+    for cls, idxs in class_to_indices.items():
+        random.shuffle(idxs)
+        n = len(idxs)
+        n_train = int(round(n * train))
+        n_val = int(round(n * val))
+        # Ensure total = n
+        if n_train + n_val > n:
+            n_val = max(0, n - n_train)
+        n_test = n - n_train - n_val
 
-print(f"\n✅ ডেটাসেট সফলভাবে তৈরি হয়েছে!")
-print(f"মোট বার্তা: {len(data)}")
-print(f"স্প্যাম: {len(spam_messages)} (৩৫%)")
-print(f"হ্যাম: {len(ham_messages)} (৬৫%)")
-print(f"সমস্ত বার্তা অনন্য!")
+        for i in idxs[:n_train]:
+            splits[i] = "train"
+        for i in idxs[n_train : n_train + n_val]:
+            splits[i] = "val"
+        for i in idxs[n_train + n_val : n_train + n_val + n_test]:
+            splits[i] = "test"
+    return splits
+
+
+def build_dataset(target_spam: int, target_ham: int, max_attempts: int = 2_000_000) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+
+    # Dedupe on (label, normalized) to reduce leakage.
+    seen: set[tuple[str, str]] = set()
+    attempts = 0
+
+    def add_row(label: str, raw: str) -> bool:
+        normalized = normalize_text(raw)
+        if _is_too_short(normalized):
+            return False
+        key = (label, normalized)
+        if key in seen:
+            return False
+        seen.add(key)
+
+        category = categorize_message(label=label, normalized_text=normalized, raw_text=raw)
+        digits = _count_digits(raw)
+        has_urgent = int(any(w in raw for w in URGENT_WORDS))
+        contains_url = int("[URL]" in normalized or "[SHORT_URL]" in normalized)
+        contains_phone = int("[PHONE]" in normalized)
+        contains_money = int("[AMOUNT]" in normalized)
+
+        rows.append(
+            {
+                "label": label,
+                "category": category,
+                # Keep common column name 'text' as the normalized/tokenized text
+                "text": normalized,
+                # Preserve the original message for audit/debug
+                "text_raw": raw,
+                "text_normalized": normalized,
+                "contains_url": contains_url,
+                "contains_phone": contains_phone,
+                "contains_money_amount": contains_money,
+                "length_of_message": len(normalized),
+                "number_of_digits": digits,
+                "has_urgent_words": has_urgent,
+            }
+        )
+        return True
+
+    spam_count = 0
+    ham_count = 0
+
+    print(f"স্প্যাম বার্তা তৈরি করা হচ্ছে... (target={target_spam})")
+    while spam_count < target_spam:
+        attempts += 1
+        if attempts > max_attempts:
+            raise RuntimeError(
+                f"Unable to reach target_spam={target_spam} with current templates/normalization. Reached {spam_count}."
+            )
+        raw = generate_spam_message()
+        raw = augment_spam_text(raw)
+        if add_row("spam", raw):
+            spam_count += 1
+            if spam_count % 1000 == 0:
+                print(f"স্প্যাম: {spam_count}/{target_spam}")
+
+    print(f"হ্যাম বার্তা তৈরি করা হচ্ছে... (target={target_ham})")
+    attempts = 0
+    while ham_count < target_ham:
+        attempts += 1
+        if attempts > max_attempts:
+            raise RuntimeError(
+                f"Unable to reach target_ham={target_ham} with current templates/normalization. Reached {ham_count}."
+            )
+        raw = generate_ham_message()
+        raw = augment_ham_text(raw)
+        if add_row("ham", raw):
+            ham_count += 1
+            if ham_count % 1000 == 0:
+                print(f"হ্যাম: {ham_count}/{target_ham}")
+
+    random.shuffle(rows)
+    return rows
+
+
+def write_dataset_csv(rows: list[dict[str, object]], output_path: str, add_split: bool) -> None:
+    if not rows:
+        raise ValueError("No rows to write")
+
+    if add_split:
+        splits = _make_split_labels([r["label"] for r in rows], train=0.8, val=0.1, test=0.1)
+        for r, s in zip(rows, splits, strict=True):
+            r["split"] = s
+
+    # Stable column order (label/text stays compatible)
+    fieldnames = [
+        "label",
+        "category",
+        "text",
+        "text_raw",
+        "text_normalized",
+        "contains_url",
+        "contains_phone",
+        "contains_money_amount",
+        "length_of_message",
+        "number_of_digits",
+        "has_urgent_words",
+    ]
+    if add_split:
+        fieldnames.append("split")
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Bangla SMS dataset generator (spam/ham)")
+    parser.add_argument("--spam", type=int, default=6000, help="Number of spam samples")
+    parser.add_argument("--ham", type=int, default=6000, help="Number of ham samples")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="bangla_sms_dataset.csv",
+        help="Output CSV path",
+    )
+    parser.add_argument(
+        "--no-split",
+        action="store_true",
+        help="Do not add the stratified train/val/test split column",
+    )
+    args = parser.parse_args()
+
+    rows = build_dataset(target_spam=args.spam, target_ham=args.ham)
+    write_dataset_csv(rows, output_path=args.output, add_split=(not args.no_split))
+
+    spam_n = sum(1 for r in rows if r["label"] == "spam")
+    ham_n = sum(1 for r in rows if r["label"] == "ham")
+    print("\n✅ ডেটাসেট সফলভাবে তৈরি হয়েছে!")
+    print(f"ফাইল: {args.output}")
+    print(f"মোট বার্তা: {len(rows)}")
+    print(f"স্প্যাম: {spam_n}")
+    print(f"হ্যাম: {ham_n}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
